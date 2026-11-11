@@ -7,8 +7,10 @@ function App() {
 
   const handleTexFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
-    if (file && file.type === 'application/x-tex') {
+    if (file && file.name.toLowerCase().endsWith('.tex')) {
       setTexFile(file)
+    } else {
+      setTexFile(null)
     }
   }
 
