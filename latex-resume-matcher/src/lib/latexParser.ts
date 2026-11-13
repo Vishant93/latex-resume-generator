@@ -37,7 +37,7 @@ function stripLatexComments(texContent: string): string {
 
 function extractExperienceSection(texContent: string): string {
   const experienceMatch = texContent.match(
-    /\\section\s*\{[^}]*experience[^}]*\}([\s\S]*?)(?=\\section\s*\{|\\end\s*\{document\}|$)/i,
+    /\\section\*?\s*\{[^}]*experience[^}]*\}([\s\S]*?)(?=\\section\*?\s*\{|\\end\s*\{document\}|$)/i,
   )
 
   if (experienceMatch) {
@@ -94,14 +94,15 @@ function extractCommandBodies(text: string, commandName: string): string[] {
 
 function extractItemBodies(text: string): string[] {
   const results: string[] = []
-  const command = '\\item'
+  const itemRe = /\\item(?![A-Za-z])/g
   let searchIndex = 0
 
   while (searchIndex < text.length) {
-    const start = text.indexOf(command, searchIndex)
-    if (start === -1) break
+    itemRe.lastIndex = searchIndex
+    const itemMatch = itemRe.exec(text)
+    if (!itemMatch) break
 
-    let cursor = start + command.length
+    let cursor = itemRe.lastIndex
     while (cursor < text.length && /\s/.test(text[cursor])) {
       cursor += 1
     }
@@ -131,8 +132,9 @@ function extractItemBodies(text: string): string[] {
         searchIndex = cursor + 1
       }
     } else {
-      const nextItem = text.indexOf('\\item', start + command.length)
-      const cutOff = nextItem === -1 ? text.length : nextItem
+      const rest = text.slice(cursor)
+      const stop = rest.search(/\\item(?![A-Za-z])|\\end\s*\{|\\begin\s*\{|\\resume[A-Za-z]*/)
+      const cutOff = stop === -1 ? text.length : cursor + stop
       value = text.slice(cursor, cutOff)
       searchIndex = cutOff
     }
@@ -155,14 +157,14 @@ function normalizeLatexText(value: string): string {
     .replace(/\\url\s*(?:\[[^\]]*\])?\{([^{}]+)\}/g, '$1')
     .replace(/\\(?:LaTeX|TeX)/g, 'LaTeX')
     .replace(/\\[A-Za-z]+/g, ' ')
-    .replace(/\\[&%$#_{}]/g, ' ')
     .replace(/\\[~^]/g, ' ')
     .replace(/\\,/g, ' ')
     .replace(/\\-/g, '-')
     .replace(/\\\s+/g, ' ')
-    .replace(/\{+|\}+|\[+|\]+|\(+|\)+/g, ' ')
-    .replace(/\$/g, ' ')
+    .replace(/(?<!\\)\{+|(?<!\\)\}+|\[+|\]+|\(+|\)+/g, ' ')
+    .replace(/(?<!\\)\$/g, ' ')
     .replace(/\\\\/g, ' ')
+    .replace(/\\([&%$#_{}])/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()
 }
