@@ -227,8 +227,8 @@ function createTailoredTexCopy(
       'g',
     )
 
-    const replacement = `$1${escapeLatexText(replacementText)}$2`
-    updatedText = updatedText.replace(commandMatcher, replacement)
+    const escaped = escapeLatexText(replacementText)
+    updatedText = updatedText.replace(commandMatcher, (_m, open: string, close: string) => `${open}${escaped}${close}`)
   }
 
   return updatedText
