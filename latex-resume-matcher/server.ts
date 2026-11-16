@@ -11,7 +11,7 @@ const port = Number(process.env.PORT ?? 3001)
 const workingDirectory = path.dirname(fileURLToPath(import.meta.url))
 const outputDirectory = path.join(workingDirectory, 'output')
 
-app.use(cors())
+app.use(cors({ origin: 'http://localhost:5173' }))
 app.use(express.json({ limit: '10mb' }))
 
 app.get('/api/health', (_req, res) => {
@@ -59,7 +59,7 @@ app.post('/api/tailor', async (req, res) => {
   }
 })
 
-app.listen(port, () => {
+app.listen(port, '127.0.0.1', () => {
   console.log(`resume tailoring service running on http://localhost:${port}`)
 })
 
@@ -68,19 +68,20 @@ function escapeRegExp(value: string): string {
 }
 
 function escapeLatexText(value: string): string {
-  return value
-    .replace(/\\/g, '\\textbackslash{}')
-    .replace(/&/g, '\\&')
-    .replace(/%/g, '\\%')
-    .replace(/\$/g, '\\$')
-    .replace(/#/g, '\\#')
-    .replace(/_/g, '\\_')
-    .replace(/\{/g, '\\{')
-    .replace(/\}/g, '\\}')
-    .replace(/~/g, '\\textasciitilde{}')
-    .replace(/\^/g, '\\textasciicircum{}')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const map: Record<string, string> = {
+    '\\': '\\textbackslash{}',
+    '&': '\\&',
+    '%': '\\%',
+    '$': '\\$',
+    '#': '\\#',
+    '_': '\\_',
+    '{': '\\{',
+    '}': '\\}',
+    '~': '\\textasciitilde{}',
+    '^': '\\textasciicircum{}',
+  }
+
+  return value.replace(/[\\&%$#_{}~^]/g, (character) => map[character]).replace(/\s+/g, ' ').trim()
 }
 
 function extractJobKeywords(jobDescription: string): string[] {
@@ -259,8 +260,12 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
     await new Promise<void>((resolve, reject) => {
       execFile(
         latexBin,
-        ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', path.dirname(texFilePath), texFilePath],
-        { cwd: path.dirname(texFilePath) },
+        ['-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', '-output-directory', path.dirname(texFilePath), texFilePath],
+        {
+          cwd: path.dirname(texFilePath),
+          timeout: 30_000,
+          env: { ...process.env, openin_any: 'p' },
+        },
         (error) => {
           if (error) {
             reject(error)
