@@ -1,16 +1,42 @@
 import { useState, type ChangeEvent, type FormEvent } from 'react'
+import { parseExperienceBullets } from './lib/latexParser'
 import './App.css'
 
 function App() {
   const [texFile, setTexFile] = useState<File | null>(null)
   const [jobDescription, setJobDescription] = useState('')
+  const [experienceBullets, setExperienceBullets] = useState<string[]>([])
+  const [parseError, setParseError] = useState('')
 
-  const handleTexFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
+  const handleTexFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
-    if (file && file.name.toLowerCase().endsWith('.tex')) {
-      setTexFile(file)
-    } else {
+
+    if (!file) {
       setTexFile(null)
+      setExperienceBullets([])
+      setParseError('')
+      return
+    }
+
+    if (!file.name.toLowerCase().endsWith('.tex')) {
+      setTexFile(null)
+      setExperienceBullets([])
+      setParseError('Please upload a .tex file.')
+      return
+    }
+
+    try {
+      const content = await file.text()
+      const bullets = parseExperienceBullets(content)
+
+      setTexFile(file)
+      setExperienceBullets(bullets)
+      setParseError(bullets.length === 0 ? 'No experience bullets were found in that LaTeX resume.' : '')
+    } catch (error) {
+      console.error('Failed to parse .tex file', error)
+      setTexFile(file)
+      setExperienceBullets([])
+      setParseError('The file could not be parsed as LaTeX.')
     }
   }
 
@@ -20,9 +46,8 @@ function App() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault()
-    // TODO: Add logic to match resume to job description
-    // For now, just log the data
     console.log('Uploaded .tex file:', texFile)
+    console.log('Experience bullets:', experienceBullets)
     console.log('Job Description:', jobDescription)
   }
 
@@ -40,6 +65,24 @@ function App() {
             required
           />
         </div>
+
+        {texFile && (
+          <div className="results-card">
+            <h2>Experience bullets</h2>
+            {experienceBullets.length > 0 ? (
+              <ul className="bullet-list">
+                {experienceBullets.map((bullet, index) => (
+                  <li key={`${bullet}-${index}`}>{bullet}</li>
+                ))}
+              </ul>
+            ) : (
+              <p>No experience bullets found.</p>
+            )}
+          </div>
+        )}
+
+        {parseError && <p className="error-message">{parseError}</p>}
+
         <div className="form-group">
           <label htmlFor="jobDescription">Paste LinkedIn Job Description</label>
           <textarea
