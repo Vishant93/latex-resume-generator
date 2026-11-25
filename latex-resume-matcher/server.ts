@@ -5,6 +5,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseResumeDocument } from './src/lib/latexParser.ts'
+import { escapeLatexWithFormatting } from './src/lib/latexEscape.ts'
 
 const app = express()
 const port = Number(process.env.PORT ?? 3001)
@@ -103,36 +104,6 @@ app.listen(port, () => {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function escapeLatexText(value: string): string {
-  return value
-    .replace(/\\/g, '\\textbackslash{}')
-    .replace(/&/g, '\\&')
-    .replace(/%/g, '\\%')
-    .replace(/\$/g, '\\$')
-    .replace(/#/g, '\\#')
-    .replace(/_/g, '\\_')
-    .replace(/\{/g, '\\{')
-    .replace(/\}/g, '\\}')
-    .replace(/~/g, '\\textasciitilde{}')
-    .replace(/\^/g, '\\textasciicircum{}')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function escapeLatexWithFormatting(value: string): string {
-  const protectedCommands: string[] = []
-  const protectedValue = value.replace(/\\(textbf|textit|emph)\{([^{}]+)\}/g, (_match, commandName: string, content: string) => {
-    const index = protectedCommands.push(`\\${commandName}{${escapeLatexText(content)}}`) - 1
-    return `__LATEX_FORMAT_${index}__`
-  })
-
-  let escaped = escapeLatexText(protectedValue)
-  protectedCommands.forEach((command, index) => {
-    escaped = escaped.replace(`__LATEX_FORMAT_${index}__`, command)
-  })
-  return escaped
 }
 
 const MAX_CONCURRENT_COMPILATIONS = 2
