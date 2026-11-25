@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parseResumeDocument } from './src/lib/latexParser.ts'
 import { escapeLatexWithFormatting } from './src/lib/latexEscape.ts'
 
-const app = express()
+export const app = express()
 const port = Number(process.env.PORT ?? 3001)
 const workingDirectory = path.dirname(fileURLToPath(import.meta.url))
 const outputDirectory = path.join(workingDirectory, 'output')
@@ -98,9 +98,11 @@ app.post('/api/tailor', async (req, res) => {
   }
 })
 
-app.listen(port, () => {
-  console.log(`resume tailoring service running on http://localhost:${port}`)
-})
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => {
+    console.log(`resume tailoring service running on http://localhost:${port}`)
+  })
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -121,89 +123,7 @@ function releaseCompilationSlot(): void {
   activeCompilations = Math.max(0, activeCompilations - 1)
 }
 
-async function tailorBullets(
-  bulletEntries: Array<{ id: string; text: string; raw: string; experienceTitle: string }>,
-  jobDescription: string,
-): Promise<Array<{ id: string; text: string }>> {
-  const ollamaModel = process.env.OLLAMA_MODEL ?? 'qwen2.5:latest'
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
-
-  try {
-    const aiResponse = await fetch(`${ollamaBaseUrl}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: ollamaModel,
-        prompt: `You are a resume editor.
-Rewrite each supplied experience bullet for the target job.
-Return only valid JSON matching this exact schema:
-{"bullets":[{"id":"exp-001","text":"..."},...]}
-Rules:
-- Preserve every factual claim, technology, and metric exactly.
-- Do not append keywords, summaries, or phrases such as "emphasizing".
-- Do not invent experience or change unrelated sections.
-- Use concise, professional resume phrasing.
-- Return every supplied id exactly once.
-
-Job description:
-${jobDescription}
-
-Bullets:
-${bulletEntries.map((bullet) => `${bullet.id}: ${bullet.text}`).join('\n')}`,
-        stream: false,
-      }),
-    })
-
-    if (aiResponse.ok) {
-      const payload = await aiResponse.json() as { response?: string }
-      const parsed = parseJsonResponse(payload.response ?? '')
-
-      if (parsed?.bullets?.length) {
-        const validIds = new Set(bulletEntries.map((bullet) => bullet.id))
-        const generatedMap = new Map<string, string>()
-
-        for (const bullet of parsed.bullets) {
-          const id = String(bullet.id)
-          const text = typeof bullet.text === 'string' ? bullet.text.replace(/\s+/g, ' ').trim() : ''
-          if (validIds.has(id) && text && text.length <= 500 && !generatedMap.has(id)) {
-            generatedMap.set(id, text)
-          }
-        }
-
-        if (generatedMap.size === bulletEntries.length) {
-          return bulletEntries.map((bullet) => ({
-            id: bullet.id,
-            text: sanitizeTailoredBullet(bullet.text, generatedMap.get(bullet.id) ?? bullet.text),
-          }))
-        }
-      }
-    }
-  } catch {
-    // Conservative fallback: leave all verified resume content unchanged.
-  }
-
-  return bulletEntries.map((bullet) => ({ id: bullet.id, text: bullet.text }))
-}
-
-function parseJsonResponse(responseText: string): { bullets?: Array<{ id: string; text: string }> } | null {
-  if (!responseText) return null
-
-  const cleanText = responseText.trim()
-  const firstBrace = cleanText.indexOf('{')
-  const lastBrace = cleanText.lastIndexOf('}')
-
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-    return null
-  }
-
-  try {
-    return JSON.parse(cleanText.slice(firstBrace, lastBrace + 1)) as { bullets?: Array<{ id: string; text: string }> }
-  } catch {
-    return null
-  }
-}
-
-function createTailoredTexCopy(
+export function createTailoredTexCopy(
   originalTex: string,
   bulletEntries: Array<{ id: string; text: string; raw: string }>,
   tailoredBullets: Array<{ id: string; text: string }>,
@@ -232,11 +152,10 @@ function createTailoredTexCopy(
 
     const replacementTextWithFormatting = applyOriginalFormatting(entry.raw, replacementText)
     const escapedReplacementText = escapeLatexWithFormatting(replacementTextWithFormatting)
-    const replacement = `$1${escapedReplacementText}$2`
     updatedText = updatedText
-      .replace(commandMatcher, replacement)
-      .replace(itemMatcher, replacement)
-      .replace(plainItemMatcher, `$1${escapedReplacementText} `)
+      .replace(commandMatcher, (_match, prefix: string, suffix: string) => `${prefix}${escapedReplacementText}${suffix}`)
+      .replace(itemMatcher, (_match, prefix: string, suffix: string) => `${prefix}${escapedReplacementText}${suffix}`)
+      .replace(plainItemMatcher, (_match, prefix: string) => `${prefix}${escapedReplacementText} `)
   }
 
   return normalizeListClosers(updatedText)
@@ -373,4 +292,86 @@ function sanitizeTailoredBullet(original: string, rewritten: string): string {
   })
 
   return droppedMetric ? original : cleaned
+}
+
+async function tailorBullets(
+  bulletEntries: Array<{ id: string; text: string; raw: string; experienceTitle: string }>,
+  jobDescription: string,
+): Promise<Array<{ id: string; text: string }>> {
+  const ollamaModel = process.env.OLLAMA_MODEL ?? 'qwen2.5:latest'
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
+
+  try {
+    const aiResponse = await fetch(`${ollamaBaseUrl}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        prompt: `You are a resume editor.
+Rewrite each supplied experience bullet for the target job.
+Return only valid JSON matching this exact schema:
+{"bullets":[{"id":"exp-001","text":"..."},...]}
+Rules:
+- Preserve every factual claim, technology, and metric exactly.
+- Do not append keywords, summaries, or phrases such as "emphasizing".
+- Do not invent experience or change unrelated sections.
+- Use concise, professional resume phrasing.
+- Return every supplied id exactly once.
+
+Job description:
+${jobDescription}
+
+Bullets:
+${bulletEntries.map((bullet) => `${bullet.id}: ${bullet.text}`).join('\n')}`,
+        stream: false,
+      }),
+    })
+
+    if (aiResponse.ok) {
+      const payload = await aiResponse.json() as { response?: string }
+      const parsed = parseJsonResponse(payload.response ?? '')
+
+      if (parsed?.bullets?.length) {
+        const validIds = new Set(bulletEntries.map((bullet) => bullet.id))
+        const generatedMap = new Map<string, string>()
+
+        for (const bullet of parsed.bullets) {
+          const id = String(bullet.id)
+          const text = typeof bullet.text === 'string' ? bullet.text.replace(/\s+/g, ' ').trim() : ''
+          if (validIds.has(id) && text && text.length <= 500 && !generatedMap.has(id)) {
+            generatedMap.set(id, text)
+          }
+        }
+
+        if (generatedMap.size === bulletEntries.length) {
+          return bulletEntries.map((bullet) => ({
+            id: bullet.id,
+            text: sanitizeTailoredBullet(bullet.text, generatedMap.get(bullet.id) ?? bullet.text),
+          }))
+        }
+      }
+    }
+  } catch {
+    // Conservative fallback: leave all verified resume content unchanged.
+  }
+
+  return bulletEntries.map((bullet) => ({ id: bullet.id, text: bullet.text }))
+}
+
+function parseJsonResponse(responseText: string): { bullets?: Array<{ id: string; text: string }> } | null {
+  if (!responseText) return null
+
+  const cleanText = responseText.trim()
+  const firstBrace = cleanText.indexOf('{')
+  const lastBrace = cleanText.lastIndexOf('}')
+
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+    return null
+  }
+
+  try {
+    return JSON.parse(cleanText.slice(firstBrace, lastBrace + 1)) as { bullets?: Array<{ id: string; text: string }> }
+  } catch {
+    return null
+  }
 }
