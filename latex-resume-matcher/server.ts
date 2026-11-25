@@ -63,7 +63,19 @@ app.post('/api/tailor', async (req, res) => {
     const tailoredBullets = await tailorBullets(bulletEntries, jobDescription)
     const tailoredTex = createTailoredTexCopy(texContent, bulletEntries, tailoredBullets)
     const savedCopy = await saveGeneratedTex(tailoredTex)
-    const compiledPdf = await compileLatexToPdf(savedCopy)
+
+    if (!(await acquireCompilationSlot())) {
+      return res.status(503).json({
+        error: 'PDF compilation is temporarily busy. Please retry shortly.',
+      })
+    }
+
+    let compiledPdf: { pdfPath: string | null; error?: string }
+    try {
+      compiledPdf = await compileLatexToPdf(savedCopy)
+    } finally {
+      releaseCompilationSlot()
+    }
 
     return res.json({
       texPath: path.relative(workingDirectory, savedCopy),
@@ -121,6 +133,21 @@ function escapeLatexWithFormatting(value: string): string {
     escaped = escaped.replace(`__LATEX_FORMAT_${index}__`, command)
   })
   return escaped
+}
+
+const MAX_CONCURRENT_COMPILATIONS = 2
+let activeCompilations = 0
+
+async function acquireCompilationSlot(): Promise<boolean> {
+  if (activeCompilations >= MAX_CONCURRENT_COMPILATIONS) {
+    return false
+  }
+  activeCompilations += 1
+  return true
+}
+
+function releaseCompilationSlot(): void {
+  activeCompilations = Math.max(0, activeCompilations - 1)
 }
 
 async function tailorBullets(
@@ -271,7 +298,12 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
       execFile(
         latexBin,
         ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', path.dirname(texFilePath), texFilePath],
-        { cwd: path.dirname(texFilePath) },
+        {
+          cwd: path.dirname(texFilePath),
+          timeout: 30_000,
+          killSignal: 'SIGKILL',
+          maxBuffer: 1024 * 1024,
+        },
         (error) => {
           if (error) {
             reject(error)
@@ -286,6 +318,15 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
     return { pdfPath }
   } catch (error) {
     console.error('LaTeX compile failed:', error)
+    if (error instanceof Error) {
+      const processError = error as unknown as { killed?: boolean; code?: string | number; signal?: string | null }
+      if (processError.killed || processError.code === 'ETIMEDOUT' || processError.signal === 'SIGKILL') {
+        return {
+          pdfPath: null,
+          error: 'LaTeX compilation timed out after 30 seconds and was terminated.',
+        }
+      }
+    }
     return {
       pdfPath: null,
       error: error instanceof Error ? error.message : 'The document failed to compile.',
