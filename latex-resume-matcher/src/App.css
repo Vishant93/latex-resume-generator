@@ -73,3 +73,29 @@ button.submit-button {
 button.submit-button:hover {
   background-color: #0056b3;
 }
+
+button.submit-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.download-link {
+  display: inline-block;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: #0f766e;
+  color: white;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.download-link:hover {
+  background: #115e59;
+}

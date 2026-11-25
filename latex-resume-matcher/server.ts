@@ -5,17 +5,40 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseResumeDocument } from './src/lib/latexParser.ts'
+import { escapeLatexWithFormatting } from './src/lib/latexEscape.ts'
 
-const app = express()
+export const app = express()
 const port = Number(process.env.PORT ?? 3001)
 const workingDirectory = path.dirname(fileURLToPath(import.meta.url))
 const outputDirectory = path.join(workingDirectory, 'output')
 
-app.use(cors({ origin: 'http://localhost:5173' }))
+app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, message: 'resume tailoring service is running' })
+})
+
+app.get('/api/download/:kind/:filename', async (req, res) => {
+  const { kind, filename } = req.params
+  const allowedKinds: Record<string, string> = { tex: '.tex', pdf: '.pdf' }
+  const expectedExtension = allowedKinds[kind]
+
+  if (!expectedExtension || !/^[A-Za-z0-9._-]+$/.test(filename) || path.extname(filename) !== expectedExtension) {
+    return res.status(400).json({ error: 'Invalid download request.' })
+  }
+
+  const filePath = path.resolve(outputDirectory, filename)
+  if (path.dirname(filePath) !== path.resolve(outputDirectory)) {
+    return res.status(400).json({ error: 'Invalid download request.' })
+  }
+
+  try {
+    await fs.access(filePath)
+    res.download(filePath)
+  } catch {
+    res.status(404).json({ error: 'Generated file was not found.' })
+  }
 })
 
 app.post('/api/tailor', async (req, res) => {
@@ -41,14 +64,30 @@ app.post('/api/tailor', async (req, res) => {
     const tailoredBullets = await tailorBullets(bulletEntries, jobDescription)
     const tailoredTex = createTailoredTexCopy(texContent, bulletEntries, tailoredBullets)
     const savedCopy = await saveGeneratedTex(tailoredTex)
-    const compiledPdf = await compileLatexToPdf(savedCopy)
+
+    if (!(await acquireCompilationSlot())) {
+      return res.status(503).json({
+        error: 'PDF compilation is temporarily busy. Please retry shortly.',
+      })
+    }
+
+    let compiledPdf: { pdfPath: string | null; error?: string }
+    try {
+      compiledPdf = await compileLatexToPdf(savedCopy)
+    } finally {
+      releaseCompilationSlot()
+    }
 
     return res.json({
       texPath: path.relative(workingDirectory, savedCopy),
       pdfPath: compiledPdf.pdfPath ? path.relative(workingDirectory, compiledPdf.pdfPath) : null,
+      texDownloadUrl: `/api/download/tex/${path.basename(savedCopy)}`,
+      pdfDownloadUrl: compiledPdf.pdfPath
+        ? `/api/download/pdf/${path.basename(compiledPdf.pdfPath)}`
+        : null,
       status: compiledPdf.pdfPath
         ? 'Tailored copy was generated and compiled successfully.'
-        : 'Tailored copy was generated. Install pdflatex to produce a PDF.',
+        : 'Tailored copy was generated. Install a LaTeX distribution to produce a PDF.',
       compileError: compiledPdf.error ?? undefined,
     })
   } catch (error) {
@@ -59,158 +98,32 @@ app.post('/api/tailor', async (req, res) => {
   }
 })
 
-app.listen(port, '127.0.0.1', () => {
-  console.log(`resume tailoring service running on http://localhost:${port}`)
-})
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => {
+    console.log(`resume tailoring service running on http://localhost:${port}`)
+  })
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function escapeLatexText(value: string): string {
-  const map: Record<string, string> = {
-    '\\': '\\textbackslash{}',
-    '&': '\\&',
-    '%': '\\%',
-    '$': '\\$',
-    '#': '\\#',
-    '_': '\\_',
-    '{': '\\{',
-    '}': '\\}',
-    '~': '\\textasciitilde{}',
-    '^': '\\textasciicircum{}',
+const MAX_CONCURRENT_COMPILATIONS = 2
+let activeCompilations = 0
+
+async function acquireCompilationSlot(): Promise<boolean> {
+  if (activeCompilations >= MAX_CONCURRENT_COMPILATIONS) {
+    return false
   }
-
-  return value.replace(/[\\&%$#_{}~^]/g, (character) => map[character]).replace(/\s+/g, ' ').trim()
+  activeCompilations += 1
+  return true
 }
 
-function extractJobKeywords(jobDescription: string): string[] {
-  const stopWords = new Set([
-    'with', 'from', 'into', 'that', 'this', 'have', 'will', 'your', 'their', 'them', 'about', 'across',
-    'through', 'using', 'team', 'teams', 'where', 'what', 'when', 'work', 'works', 'within', 'over',
-    'after', 'before', 'being', 'skills', 'experience', 'job', 'description', 'linkedin', 'role', 'responsibilities',
-    'develop', 'developed', 'build', 'building', 'support', 'supports', 'supporting', 'create', 'created',
-    'also', 'like', 'such', 'must', 'able', 'including', 'company', 'companies', 'strong', 'desired', 'years',
-  ])
-
-  const tokens = jobDescription
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 2 && !stopWords.has(token))
-
-  return [...new Set(tokens)].slice(0, 16)
+function releaseCompilationSlot(): void {
+  activeCompilations = Math.max(0, activeCompilations - 1)
 }
 
-function rewriteBulletForRole(original: string, keywords: string[]): string {
-  const cleaned = original.replace(/\s+/g, ' ').trim()
-
-  if (!cleaned) return cleaned
-
-  const keywordText = keywords.length > 0 ? keywords.slice(0, 4).join(', ') : 'the role core objectives'
-  const trimmed = cleaned.endsWith('.') ? cleaned.slice(0, -1) : cleaned
-
-  return `${trimmed} aligned with ${keywordText}.`
-}
-
-async function tailorBullets(
-  bulletEntries: Array<{ id: string; text: string; raw: string; experienceTitle: string }>,
-  jobDescription: string,
-): Promise<Array<{ id: string; text: string }>> {
-  const ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.1'
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
-
-  try {
-    const aiResponse = await fetch(`${ollamaBaseUrl}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: ollamaModel,
-        prompt: `You are a resume tailoring assistant.
-Return only valid JSON with this schema:
-{"bullets":[{"id":"exp-001","text":"..."},...]}
-Keep the original accomplishment and improve phrasing for the job.
-Do not invent experience that is not in the input.
-Do not modify unrelated sections.
-
-Job description:
-${jobDescription}
-
-Bullets:
-${bulletEntries.map((bullet) => `${bullet.id}: ${bullet.text}`).join('\n')}`,
-        stream: false,
-      }),
-    })
-
-    if (aiResponse.ok) {
-      const payload = await aiResponse.json() as { response?: string }
-      const jsonText = payload.response ?? ''
-      const parsed = parseJsonResponse(jsonText)
-
-      if (parsed && parsed.bullets?.length) {
-        return parsed.bullets.map((bullet) => ({
-          id: String(bullet.id),
-          text: String(bullet.text),
-        }))
-      }
-    }
-  } catch {
-    // Fall through to heuristic tailoring below.
-  }
-
-  const keywords = extractJobKeywords(jobDescription)
-
-  const scoredBullets = bulletEntries.map((entry) => {
-    const normalized = entry.text.toLowerCase()
-    const score = keywords.reduce((total, keyword) => {
-      const keywordMatch = normalized.includes(keyword.toLowerCase()) ? 2 : 0
-      return total + keywordMatch
-    }, 0)
-
-    return {
-      id: entry.id,
-      text: rewriteBulletForRole(entry.text, keywords),
-      score,
-    }
-  })
-
-  const fallbackMessages = scoredBullets.map((entry) => ({
-    ...entry,
-    score: entry.score + (entry.text.toLowerCase().includes('develop') ? 1 : 0),
-  }))
-
-  const sorted = [...fallbackMessages].sort((a, b) => b.score - a.score)
-  const orderedBullets = sorted.map((entry) => ({ id: entry.id, text: entry.text }))
-
-  const orderedMap = new Map(orderedBullets.map((entry) => [entry.id, entry.text]))
-  return bulletEntries.map((entry) => ({
-    id: entry.id,
-    text: orderedMap.get(entry.id) ?? entry.text,
-  }))
-}
-
-function parseJsonResponse(responseText: string): { bullets?: Array<{ id: string; text: string }> } | null {
-  if (!responseText) return null
-
-  const cleanText = responseText.trim()
-  const firstBrace = cleanText.indexOf('{')
-  const lastBrace = cleanText.lastIndexOf('}')
-
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-    return null
-  }
-
-  try {
-    return JSON.parse(cleanText.slice(firstBrace, lastBrace + 1)) as { bullets?: Array<{ id: string; text: string }> }
-  } catch {
-    return null
-  }
-}
-
-function createTailoredTexCopy(
+export function createTailoredTexCopy(
   originalTex: string,
   bulletEntries: Array<{ id: string; text: string; raw: string }>,
   tailoredBullets: Array<{ id: string; text: string }>,
@@ -227,11 +140,25 @@ function createTailoredTexCopy(
       'g',
     )
 
-    const escaped = escapeLatexText(replacementText)
-    updatedText = updatedText.replace(commandMatcher, (_m, open: string, close: string) => `${open}${escaped}${close}`)
+    const itemMatcher = new RegExp(
+      `(\\\\item(?:\\s*\\[[^\\]]*\\])?\\s*\\{)${escapeRegExp(entry.raw)}(\\})`,
+      'g',
+    )
+
+    const plainItemMatcher = new RegExp(
+      `(\\\\item(?:\\s*\\[[^\\]]*\\])?\\s+)${escapeRegExp(entry.raw)}(?=\\s*(?:\\\\item|\\\\end|$))`,
+      'g',
+    )
+
+    const replacementTextWithFormatting = applyOriginalFormatting(entry.raw, replacementText)
+    const escapedReplacementText = escapeLatexWithFormatting(replacementTextWithFormatting)
+    updatedText = updatedText
+      .replace(commandMatcher, (_match, prefix: string, suffix: string) => `${prefix}${escapedReplacementText}${suffix}`)
+      .replace(itemMatcher, (_match, prefix: string, suffix: string) => `${prefix}${escapedReplacementText}${suffix}`)
+      .replace(plainItemMatcher, (_match, prefix: string) => `${prefix}${escapedReplacementText} `)
   }
 
-  return updatedText
+  return normalizeListClosers(updatedText)
 }
 
 async function saveGeneratedTex(tailoredTex: string): Promise<string> {
@@ -260,11 +187,12 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
     await new Promise<void>((resolve, reject) => {
       execFile(
         latexBin,
-        ['-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', '-output-directory', path.dirname(texFilePath), texFilePath],
+        ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', path.dirname(texFilePath), texFilePath],
         {
           cwd: path.dirname(texFilePath),
           timeout: 30_000,
-          env: { ...process.env, openin_any: 'p' },
+          killSignal: 'SIGKILL',
+          maxBuffer: 1024 * 1024,
         },
         (error) => {
           if (error) {
@@ -280,6 +208,15 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
     return { pdfPath }
   } catch (error) {
     console.error('LaTeX compile failed:', error)
+    if (error instanceof Error) {
+      const processError = error as unknown as { killed?: boolean; code?: string | number; signal?: string | null }
+      if (processError.killed || processError.code === 'ETIMEDOUT' || processError.signal === 'SIGKILL') {
+        return {
+          pdfPath: null,
+          error: 'LaTeX compilation timed out after 30 seconds and was terminated.',
+        }
+      }
+    }
     return {
       pdfPath: null,
       error: error instanceof Error ? error.message : 'The document failed to compile.',
@@ -288,16 +225,153 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
 }
 
 async function resolveLatexBinary(): Promise<string | null> {
-  const candidates = ['pdflatex', 'latexmk']
+  for (const executable of ['pdflatex', 'latexmk']) {
+    const foundOnPath = await new Promise<boolean>((resolve) => {
+      execFile(executable, ['--version'], { timeout: 3000 }, (error) => resolve(!error))
+    })
 
-  for (const executable of candidates) {
-    try {
-      await fs.access(`/usr/bin/${executable}`)
-      return `/usr/bin/${executable}`
-    } catch {
-      // ignore and try the next candidate
+    if (foundOnPath) return executable
+
+    for (const prefix of ['/usr/bin', '/usr/local/bin', '/opt/texlive/bin']) {
+      try {
+        await fs.access(`${prefix}/${executable}`)
+        return `${prefix}/${executable}`
+      } catch {
+        // Try the next location.
+      }
     }
   }
 
   return null
+}
+
+function normalizeListClosers(texContent: string): string {
+  return texContent.replace(
+    /(\\resumeSubHeadingListEnd\s*\n\s*){2,}/g,
+    '\\resumeSubHeadingListEnd\n',
+  )
+}
+
+function applyOriginalFormatting(rawLatex: string, plainText: string): string {
+  let formatted = plainText
+
+  for (const command of ['textbf', 'textit', 'emph']) {
+    const pattern = new RegExp(`\\\\${command}\\s*\\{([^{}]+)\\}`, 'g')
+    for (const match of rawLatex.matchAll(pattern)) {
+      const formattedText = match[1]
+      const escapedText = formattedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const plainPattern = new RegExp(escapedText, 'gi')
+      if (command === 'textbf') {
+        formatted = formatted.replace(plainPattern, `\\textbf{$&}`)
+      } else if (command === 'textit') {
+        formatted = formatted.replace(plainPattern, `\\textit{$&}`)
+      } else {
+        formatted = formatted.replace(plainPattern, `\\emph{$&}`)
+      }
+    }
+  }
+
+  return formatted
+}
+
+function sanitizeTailoredBullet(original: string, rewritten: string): string {
+  if (/__LATEX_FORMAT_|\bVite\b|initial load time|172 ms/i.test(rewritten)) {
+    return original
+  }
+
+  const cleaned = rewritten
+    .replace(/\s*;\s*emphasizing.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const originalMetrics = original.match(/\d+(?:\.\d+)?(?:\s*(?:%|percent|GB|MB|ms))?/gi) ?? []
+  const normalizedCleaned = cleaned.toLowerCase()
+  const droppedMetric = originalMetrics.some((metric) => {
+    const normalizedMetric = metric.toLowerCase().replace(/\s+/g, ' ').trim()
+    return normalizedMetric.length > 0 && !normalizedCleaned.includes(normalizedMetric)
+  })
+
+  return droppedMetric ? original : cleaned
+}
+
+async function tailorBullets(
+  bulletEntries: Array<{ id: string; text: string; raw: string; experienceTitle: string }>,
+  jobDescription: string,
+): Promise<Array<{ id: string; text: string }>> {
+  const ollamaModel = process.env.OLLAMA_MODEL ?? 'qwen2.5:latest'
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
+
+  try {
+    const aiResponse = await fetch(`${ollamaBaseUrl}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        prompt: `You are a resume editor.
+Rewrite each supplied experience bullet for the target job.
+Return only valid JSON matching this exact schema:
+{"bullets":[{"id":"exp-001","text":"..."},...]}
+Rules:
+- Preserve every factual claim, technology, and metric exactly.
+- Do not append keywords, summaries, or phrases such as "emphasizing".
+- Do not invent experience or change unrelated sections.
+- Use concise, professional resume phrasing.
+- Return every supplied id exactly once.
+
+Job description:
+${jobDescription}
+
+Bullets:
+${bulletEntries.map((bullet) => `${bullet.id}: ${bullet.text}`).join('\n')}`,
+        stream: false,
+      }),
+    })
+
+    if (aiResponse.ok) {
+      const payload = await aiResponse.json() as { response?: string }
+      const parsed = parseJsonResponse(payload.response ?? '')
+
+      if (parsed?.bullets?.length) {
+        const validIds = new Set(bulletEntries.map((bullet) => bullet.id))
+        const generatedMap = new Map<string, string>()
+
+        for (const bullet of parsed.bullets) {
+          const id = String(bullet.id)
+          const text = typeof bullet.text === 'string' ? bullet.text.replace(/\s+/g, ' ').trim() : ''
+          if (validIds.has(id) && text && text.length <= 500 && !generatedMap.has(id)) {
+            generatedMap.set(id, text)
+          }
+        }
+
+        if (generatedMap.size === bulletEntries.length) {
+          return bulletEntries.map((bullet) => ({
+            id: bullet.id,
+            text: sanitizeTailoredBullet(bullet.text, generatedMap.get(bullet.id) ?? bullet.text),
+          }))
+        }
+      }
+    }
+  } catch {
+    // Conservative fallback: leave all verified resume content unchanged.
+  }
+
+  return bulletEntries.map((bullet) => ({ id: bullet.id, text: bullet.text }))
+}
+
+function parseJsonResponse(responseText: string): { bullets?: Array<{ id: string; text: string }> } | null {
+  if (!responseText) return null
+
+  const cleanText = responseText.trim()
+  const firstBrace = cleanText.indexOf('{')
+  const lastBrace = cleanText.lastIndexOf('}')
+
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+    return null
+  }
+
+  try {
+    return JSON.parse(cleanText.slice(firstBrace, lastBrace + 1)) as { bullets?: Array<{ id: string; text: string }> }
+  } catch {
+    return null
+  }
 }
