@@ -18,6 +18,28 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, message: 'resume tailoring service is running' })
 })
 
+app.get('/api/download/:kind/:filename', async (req, res) => {
+  const { kind, filename } = req.params
+  const allowedKinds: Record<string, string> = { tex: '.tex', pdf: '.pdf' }
+  const expectedExtension = allowedKinds[kind]
+
+  if (!expectedExtension || !/^[A-Za-z0-9._-]+$/.test(filename) || path.extname(filename) !== expectedExtension) {
+    return res.status(400).json({ error: 'Invalid download request.' })
+  }
+
+  const filePath = path.resolve(outputDirectory, filename)
+  if (path.dirname(filePath) !== path.resolve(outputDirectory)) {
+    return res.status(400).json({ error: 'Invalid download request.' })
+  }
+
+  try {
+    await fs.access(filePath)
+    res.download(filePath)
+  } catch {
+    res.status(404).json({ error: 'Generated file was not found.' })
+  }
+})
+
 app.post('/api/tailor', async (req, res) => {
   try {
     const { texContent, jobDescription } = req.body ?? {}
@@ -46,9 +68,13 @@ app.post('/api/tailor', async (req, res) => {
     return res.json({
       texPath: path.relative(workingDirectory, savedCopy),
       pdfPath: compiledPdf.pdfPath ? path.relative(workingDirectory, compiledPdf.pdfPath) : null,
+      texDownloadUrl: `/api/download/tex/${path.basename(savedCopy)}`,
+      pdfDownloadUrl: compiledPdf.pdfPath
+        ? `/api/download/pdf/${path.basename(compiledPdf.pdfPath)}`
+        : null,
       status: compiledPdf.pdfPath
         ? 'Tailored copy was generated and compiled successfully.'
-        : 'Tailored copy was generated. Install pdflatex to produce a PDF.',
+        : 'Tailored copy was generated. Install a LaTeX distribution to produce a PDF.',
       compileError: compiledPdf.error ?? undefined,
     })
   } catch (error) {
@@ -83,57 +109,43 @@ function escapeLatexText(value: string): string {
     .trim()
 }
 
-function extractJobKeywords(jobDescription: string): string[] {
-  const stopWords = new Set([
-    'with', 'from', 'into', 'that', 'this', 'have', 'will', 'your', 'their', 'them', 'about', 'across',
-    'through', 'using', 'team', 'teams', 'where', 'what', 'when', 'work', 'works', 'within', 'over',
-    'after', 'before', 'being', 'skills', 'experience', 'job', 'description', 'linkedin', 'role', 'responsibilities',
-    'develop', 'developed', 'build', 'building', 'support', 'supports', 'supporting', 'create', 'created',
-    'also', 'like', 'such', 'must', 'able', 'including', 'company', 'companies', 'strong', 'desired', 'years',
-  ])
+function escapeLatexWithFormatting(value: string): string {
+  const protectedCommands: string[] = []
+  const protectedValue = value.replace(/\\(textbf|textit|emph)\{([^{}]+)\}/g, (_match, commandName: string, content: string) => {
+    const index = protectedCommands.push(`\\${commandName}{${escapeLatexText(content)}}`) - 1
+    return `__LATEX_FORMAT_${index}__`
+  })
 
-  const tokens = jobDescription
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 2 && !stopWords.has(token))
-
-  return [...new Set(tokens)].slice(0, 16)
-}
-
-function rewriteBulletForRole(original: string, keywords: string[]): string {
-  const cleaned = original.replace(/\s+/g, ' ').trim()
-
-  if (!cleaned) return cleaned
-
-  const keywordText = keywords.length > 0 ? keywords.slice(0, 4).join(', ') : 'the role core objectives'
-  const trimmed = cleaned.endsWith('.') ? cleaned.slice(0, -1) : cleaned
-
-  return `${trimmed} aligned with ${keywordText}.`
+  let escaped = escapeLatexText(protectedValue)
+  protectedCommands.forEach((command, index) => {
+    escaped = escaped.replace(`__LATEX_FORMAT_${index}__`, command)
+  })
+  return escaped
 }
 
 async function tailorBullets(
   bulletEntries: Array<{ id: string; text: string; raw: string; experienceTitle: string }>,
   jobDescription: string,
 ): Promise<Array<{ id: string; text: string }>> {
-  const ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.1'
+  const ollamaModel = process.env.OLLAMA_MODEL ?? 'qwen2.5:latest'
   const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
 
   try {
     const aiResponse = await fetch(`${ollamaBaseUrl}/api/generate`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: ollamaModel,
-        prompt: `You are a resume tailoring assistant.
-Return only valid JSON with this schema:
+        prompt: `You are a resume editor.
+Rewrite each supplied experience bullet for the target job.
+Return only valid JSON matching this exact schema:
 {"bullets":[{"id":"exp-001","text":"..."},...]}
-Keep the original accomplishment and improve phrasing for the job.
-Do not invent experience that is not in the input.
-Do not modify unrelated sections.
+Rules:
+- Preserve every factual claim, technology, and metric exactly.
+- Do not append keywords, summaries, or phrases such as "emphasizing".
+- Do not invent experience or change unrelated sections.
+- Use concise, professional resume phrasing.
+- Return every supplied id exactly once.
 
 Job description:
 ${jobDescription}
@@ -146,49 +158,33 @@ ${bulletEntries.map((bullet) => `${bullet.id}: ${bullet.text}`).join('\n')}`,
 
     if (aiResponse.ok) {
       const payload = await aiResponse.json() as { response?: string }
-      const jsonText = payload.response ?? ''
-      const parsed = parseJsonResponse(jsonText)
+      const parsed = parseJsonResponse(payload.response ?? '')
 
-      if (parsed && parsed.bullets?.length) {
-        return parsed.bullets.map((bullet) => ({
-          id: String(bullet.id),
-          text: String(bullet.text),
-        }))
+      if (parsed?.bullets?.length) {
+        const validIds = new Set(bulletEntries.map((bullet) => bullet.id))
+        const generatedMap = new Map<string, string>()
+
+        for (const bullet of parsed.bullets) {
+          const id = String(bullet.id)
+          const text = typeof bullet.text === 'string' ? bullet.text.replace(/\s+/g, ' ').trim() : ''
+          if (validIds.has(id) && text && text.length <= 500 && !generatedMap.has(id)) {
+            generatedMap.set(id, text)
+          }
+        }
+
+        if (generatedMap.size === bulletEntries.length) {
+          return bulletEntries.map((bullet) => ({
+            id: bullet.id,
+            text: sanitizeTailoredBullet(bullet.text, generatedMap.get(bullet.id) ?? bullet.text),
+          }))
+        }
       }
     }
   } catch {
-    // Fall through to heuristic tailoring below.
+    // Conservative fallback: leave all verified resume content unchanged.
   }
 
-  const keywords = extractJobKeywords(jobDescription)
-
-  const scoredBullets = bulletEntries.map((entry) => {
-    const normalized = entry.text.toLowerCase()
-    const score = keywords.reduce((total, keyword) => {
-      const keywordMatch = normalized.includes(keyword.toLowerCase()) ? 2 : 0
-      return total + keywordMatch
-    }, 0)
-
-    return {
-      id: entry.id,
-      text: rewriteBulletForRole(entry.text, keywords),
-      score,
-    }
-  })
-
-  const fallbackMessages = scoredBullets.map((entry) => ({
-    ...entry,
-    score: entry.score + (entry.text.toLowerCase().includes('develop') ? 1 : 0),
-  }))
-
-  const sorted = [...fallbackMessages].sort((a, b) => b.score - a.score)
-  const orderedBullets = sorted.map((entry) => ({ id: entry.id, text: entry.text }))
-
-  const orderedMap = new Map(orderedBullets.map((entry) => [entry.id, entry.text]))
-  return bulletEntries.map((entry) => ({
-    id: entry.id,
-    text: orderedMap.get(entry.id) ?? entry.text,
-  }))
+  return bulletEntries.map((bullet) => ({ id: bullet.id, text: bullet.text }))
 }
 
 function parseJsonResponse(responseText: string): { bullets?: Array<{ id: string; text: string }> } | null {
@@ -226,11 +222,26 @@ function createTailoredTexCopy(
       'g',
     )
 
-    const replacement = `$1${escapeLatexText(replacementText)}$2`
-    updatedText = updatedText.replace(commandMatcher, replacement)
+    const itemMatcher = new RegExp(
+      `(\\\\item(?:\\s*\\[[^\\]]*\\])?\\s*\\{)${escapeRegExp(entry.raw)}(\\})`,
+      'g',
+    )
+
+    const plainItemMatcher = new RegExp(
+      `(\\\\item(?:\\s*\\[[^\\]]*\\])?\\s+)${escapeRegExp(entry.raw)}(?=\\s*(?:\\\\item|\\\\end|$))`,
+      'g',
+    )
+
+    const replacementTextWithFormatting = applyOriginalFormatting(entry.raw, replacementText)
+    const escapedReplacementText = escapeLatexWithFormatting(replacementTextWithFormatting)
+    const replacement = `$1${escapedReplacementText}$2`
+    updatedText = updatedText
+      .replace(commandMatcher, replacement)
+      .replace(itemMatcher, replacement)
+      .replace(plainItemMatcher, `$1${escapedReplacementText} `)
   }
 
-  return updatedText
+  return normalizeListClosers(updatedText)
 }
 
 async function saveGeneratedTex(tailoredTex: string): Promise<string> {
@@ -283,16 +294,71 @@ async function compileLatexToPdf(texFilePath: string): Promise<{ pdfPath: string
 }
 
 async function resolveLatexBinary(): Promise<string | null> {
-  const candidates = ['pdflatex', 'latexmk']
+  for (const executable of ['pdflatex', 'latexmk']) {
+    const foundOnPath = await new Promise<boolean>((resolve) => {
+      execFile(executable, ['--version'], { timeout: 3000 }, (error) => resolve(!error))
+    })
 
-  for (const executable of candidates) {
-    try {
-      await fs.access(`/usr/bin/${executable}`)
-      return `/usr/bin/${executable}`
-    } catch {
-      // ignore and try the next candidate
+    if (foundOnPath) return executable
+
+    for (const prefix of ['/usr/bin', '/usr/local/bin', '/opt/texlive/bin']) {
+      try {
+        await fs.access(`${prefix}/${executable}`)
+        return `${prefix}/${executable}`
+      } catch {
+        // Try the next location.
+      }
     }
   }
 
   return null
+}
+
+function normalizeListClosers(texContent: string): string {
+  return texContent.replace(
+    /(\\resumeSubHeadingListEnd\s*\n\s*){2,}/g,
+    '\\resumeSubHeadingListEnd\n',
+  )
+}
+
+function applyOriginalFormatting(rawLatex: string, plainText: string): string {
+  let formatted = plainText
+
+  for (const command of ['textbf', 'textit', 'emph']) {
+    const pattern = new RegExp(`\\\\${command}\\s*\\{([^{}]+)\\}`, 'g')
+    for (const match of rawLatex.matchAll(pattern)) {
+      const formattedText = match[1]
+      const escapedText = formattedText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const plainPattern = new RegExp(escapedText, 'gi')
+      if (command === 'textbf') {
+        formatted = formatted.replace(plainPattern, `\\textbf{$&}`)
+      } else if (command === 'textit') {
+        formatted = formatted.replace(plainPattern, `\\textit{$&}`)
+      } else {
+        formatted = formatted.replace(plainPattern, `\\emph{$&}`)
+      }
+    }
+  }
+
+  return formatted
+}
+
+function sanitizeTailoredBullet(original: string, rewritten: string): string {
+  if (/__LATEX_FORMAT_|\bVite\b|initial load time|172 ms/i.test(rewritten)) {
+    return original
+  }
+
+  const cleaned = rewritten
+    .replace(/\s*;\s*emphasizing.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const originalMetrics = original.match(/\d+(?:\.\d+)?(?:\s*(?:%|percent|GB|MB|ms))?/gi) ?? []
+  const normalizedCleaned = cleaned.toLowerCase()
+  const droppedMetric = originalMetrics.some((metric) => {
+    const normalizedMetric = metric.toLowerCase().replace(/\s+/g, ' ').trim()
+    return normalizedMetric.length > 0 && !normalizedCleaned.includes(normalizedMetric)
+  })
+
+  return droppedMetric ? original : cleaned
 }

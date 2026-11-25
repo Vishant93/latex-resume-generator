@@ -297,7 +297,10 @@ function extractItemBodies(text: string): Array<{ text: string; raw: string; sta
       }
     } else {
       const nextItem = text.indexOf('\\item', start + command.length)
-      const cutOff = nextItem === -1 ? text.length : nextItem
+      const itemizeEnd = text.search(/\\end\s*\{(?:itemize|enumerate)\}/)
+      const candidates = [nextItem, itemizeEnd === -1 ? text.length : itemizeEnd]
+        .filter((index) => index >= start + command.length)
+      const cutOff = candidates.length > 0 ? Math.min(...candidates) : text.length
       valueStart = cursor
       valueEnd = cutOff
       value = text.slice(valueStart, valueEnd)
@@ -385,6 +388,7 @@ function extractTopLevelArguments(text: string): string[] {
 
 function normalizeLatexText(value: string): string {
   return value
+    .replace(/\\%/g, '%')
     .replace(/\\textbf\s*(?:\[[^\]]*\])?\{([^{}]+)\}/g, '$1')
     .replace(/\\textit\s*(?:\[[^\]]*\])?\{([^{}]+)\}/g, '$1')
     .replace(/\\emph\s*(?:\[[^\]]*\])?\{([^{}]+)\}/g, '$1')

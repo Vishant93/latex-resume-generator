@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Generated resume output
+output/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -5,6 +5,8 @@ import './App.css'
 type TailorResult = {
   texPath: string
   pdfPath: string | null
+  texDownloadUrl: string
+  pdfDownloadUrl: string | null
   status: string
   compileError?: string
 }
@@ -154,8 +156,16 @@ function App() {
         <div className="results-card">
           <h2>Tailored output</h2>
           <p>{tailorResult.status}</p>
-          <p>LaTeX copy: {tailorResult.texPath}</p>
-          <p>PDF: {tailorResult.pdfPath ?? 'Not generated (LaTeX compiler unavailable)'}</p>
+          <div className="download-actions">
+            <a className="download-link" href={tailorResult.texDownloadUrl} download>
+              Download tailored LaTeX
+            </a>
+            {tailorResult.pdfDownloadUrl && (
+              <a className="download-link" href={tailorResult.pdfDownloadUrl} download>
+                Download PDF
+              </a>
+            )}
+          </div>
           {tailorResult.compileError && <p className="error-message">{tailorResult.compileError}</p>}
         </div>
       )}
